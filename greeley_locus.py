@@ -9,7 +9,7 @@ Data inputs (same folder as this script):
   - region_geometry.geojson                     (area polygon geometries)
   - aadt_by_segment_dow_tod.parquet             (AADT by segment, DOW, time-of-day)
     Expected columns: newSegmentId, dow, timeSetName, aadt
-  - logo.webp                                   (organisation logo)
+  - logo.png                                    (organisation logo)
 
 Run:  streamlit run greeley_locus.py
 Requires: streamlit>=1.40, pydeck, plotly, geopandas, pandas, numpy, pyarrow
@@ -37,7 +37,7 @@ if "authenticated" not in st.session_state:
 if not st.session_state.authenticated:
     _, pwd_col, _ = st.columns([1, 2, 1])
     with pwd_col:
-        logo_path_login = Path("logo.webp")
+        logo_path_login = Path("logo.png")
         if logo_path_login.exists():
             st.image(str(logo_path_login), width=180)
         st.markdown("## City of Greeley Dashboard")
@@ -56,7 +56,7 @@ GEOM_PATH         = "segments_geometry.geojson"
 TRIP_PARQUET_PATH = "trip_summary_with_expansion_area.parquet"
 REGION_GEOM_PATH  = "region_geometry.geojson"
 AADT_PARQUET_PATH = "aadt_by_segment_dow_tod.parquet"
-LOGO_PATH         = "logo.webp"
+LOGO_PATH         = "logo.png"
 
 # ── Geofencing area exclusions ─────────────────────────────────────────────────
 # Add/remove area numbers to exclude them from the Geofencing Trips map.
@@ -124,21 +124,28 @@ def speed_to_color(series: pd.Series) -> list:
 
 
 def ratio_to_color(series: pd.Series) -> list:
-    """Blue = A slower (ratio < 1), Red = A faster (ratio > 1). Gray = no data."""
+    """Grey at ratio≈1, orange/red above 1 (Scenario A faster), blue below 1 (A slower).
+    NaN = fully transparent (hidden)."""
     out = []
     for v in series:
         if pd.isna(v):
-            out.append([160, 160, 160, 120])
-        elif v > 1.0:
-            intensity = min((v - 1.0) / 0.5, 1.0)
-            out.append([int(50 + 205 * intensity), 50, 50, 230])
+            out.append([0, 0, 0, 0])  # fully transparent – not shown
+        elif v >= 1.0:
+            t = min((v - 1.0) / 0.5, 1.0)
+            r = int(180 + 60 * t)   # 180→240
+            g = int(180 - 120 * t)  # 180→60
+            b = int(180 - 160 * t)  # 180→20
+            out.append([r, g, b, 230])
         else:
-            intensity = min((1.0 - v) / 0.5, 1.0)
-            out.append([50, 50, int(50 + 205 * intensity), 230])
+            t = min((1.0 - v) / 0.5, 1.0)
+            r = int(180 - 160 * t)  # 180→20
+            g = int(180 - 110 * t)  # 180→70
+            b = int(180 + 60 * t)   # 180→240
+            out.append([r, g, b, 230])
     return out
 
 
-def blue_gradient_color(series: pd.Series) -> list:
+def blue_gradient_color(series: pd.Series, alpha: int = 210) -> list:
     """Light blue (low) → Dark blue (high). Gray for NaN."""
     valid = series.dropna()
     if len(valid) == 0:
@@ -155,7 +162,7 @@ def blue_gradient_color(series: pd.Series) -> list:
             r = int(220 - 200 * t)
             g = int(235 - 185 * t)
             b = 255
-            out.append([r, g, b, 210])
+            out.append([r, g, b, alpha])
     return out
 
 
@@ -197,8 +204,8 @@ def make_speed_colorbar(vmin: float, vmax: float) -> go.Figure:
     return fig
 
 
-def make_aadt_colorbar(vmin: float, vmax: float) -> go.Figure:
-    """Horizontal gradient colorbar for AADT: light blue → dark blue."""
+def make_volume_colorbar(vmin: float, vmax: float) -> go.Figure:
+    """Horizontal gradient colorbar for Volume: light blue → dark blue."""
     if pd.isna(vmin) or pd.isna(vmax) or vmin >= vmax:
         return None
     n = 100
@@ -220,7 +227,7 @@ def make_aadt_colorbar(vmin: float, vmax: float) -> go.Figure:
         margin=dict(t=24, b=22, l=10, r=10),
         title=dict(
             text=(
-                f"AADT  |  "
+                f"Volume  |  "
                 f"Low ◀  {int(vmin):,} ──── {int(vmax):,}  ▶ High  "
                 f"|  Gray = No data"
             ),
@@ -353,14 +360,46 @@ def load_aadt() -> pd.DataFrame:
     return df
 
 
+@st.cache_data
+def load_volume_hourly() -> pd.DataFrame:
+    """Expand multi-hour TOD bins (e.g. '0:00-7:00') into individual hourly rows.
+    Volume is distributed evenly across the hours in each bin."""
+    import re
+    df = load_aadt()
+    pattern = re.compile(r"^(\d+):00\s*[-–]\s*(\d+):00$")
+
+    def get_hourly_labels(label):
+        m = pattern.match(str(label).strip())
+        if not m:
+            return [label]
+        s, e = int(m.group(1)), int(m.group(2))
+        if e <= s:
+            e += 24
+        return [f"{h}:00-{h+1}:00" for h in range(s, e)]
+
+    df = df.copy()
+    df["_labels"] = df["timeSetName"].apply(get_hourly_labels)
+    df["_n"] = df["_labels"].apply(len)
+    df["aadt"] = df["aadt"] / df["_n"]
+    df_exp = df.explode("_labels").copy()
+    df_exp["timeSetName"] = df_exp["_labels"]
+    df_exp = df_exp.drop(columns=["_labels", "_n"])
+    df_exp = df_exp.rename(columns={"aadt": "volume"})
+    return df_exp.reset_index(drop=True)
+
+
+ALL_VOL_TOD = [f"{h}:00-{h+1}:00" for h in range(24)]
+
+
 # ── Load all data ──────────────────────────────────────────────────────────────
 try:
-    df_speed    = load_speed()
-    df_geom     = load_geometry()
-    df_seg_attr = load_segment_attrs()
-    df_trips    = load_trips()
-    df_areas    = load_area_geometry()
-    df_aadt     = load_aadt()
+    df_speed       = load_speed()
+    df_geom        = load_geometry()
+    df_seg_attr    = load_segment_attrs()
+    df_trips       = load_trips()
+    df_areas       = load_area_geometry()
+    df_aadt        = load_aadt()
+    df_vol_hourly  = load_volume_hourly()
 except FileNotFoundError as e:
     st.error(
         f"Data file not found: {e}\n"
@@ -397,25 +436,31 @@ def fmt_aadt(v):
     return f"{int(round(v)):,}" if pd.notna(v) else "No Data"
 
 
-# ── Header: logo + title ───────────────────────────────────────────────────────
-hdr_logo, hdr_title = st.columns([1, 8])
+# ── Header: title (left) + logo (right) ───────────────────────────────────────
+hdr_title, hdr_logo = st.columns([8, 1])
+with hdr_title:
+    st.title("City of Greeley Dashboard")
 with hdr_logo:
     logo_path = Path(LOGO_PATH)
     if logo_path.exists():
         st.image(str(logo_path), width=110)
-with hdr_title:
-    st.title("City of Greeley Dashboard")
 
 # ── Session state: persistent selections (survive filter changes) ──────────────
-for _k in ["spd_sel_id", "spd_sel_street",
-            "ratio_sel_id", "ratio_sel_street",
-            "trip_sel_area",
-            "aadt_sel_id", "aadt_sel_street"]:
+_init_state = {
+    "spd_sel_id": None, "spd_sel_street": None,
+    "ratio_sel_id": None, "ratio_sel_street": None,
+    "trip_sel_area": None,
+    "vol_sel_id": None, "vol_sel_street": None,
+    # Key counters — increment to force pydeck component recreation (clears selection)
+    "spd_key_ctr": 0, "ratio_key_ctr": 0,
+    "trip_key_ctr": 0, "vol_key_ctr": 0,
+}
+for _k, _v in _init_state.items():
     if _k not in st.session_state:
-        st.session_state[_k] = None
+        st.session_state[_k] = _v
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["Road Performance", "Geofencing Trips", "Segment AADT"])
+tab1, tab2, tab3 = st.tabs(["Speed", "Trips by parking zones", "Traffic Volumes"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -431,7 +476,7 @@ with tab1:
         if metric == "Average Speed":
             fa, fb, _ = st.columns([1, 2, 1])
             dow = fa.selectbox("Day of Week", DOW_OPTIONS)
-            tod = fb.selectbox("Time of Day (as shown on map)", [TOD_AVG_ALL] + ALL_TOD)
+            tod = fb.selectbox("Time of Day (for map)", [TOD_AVG_ALL] + ALL_TOD)
         else:
             fa, fb, fc, fd = st.columns(4)
             dow_a = fa.selectbox("DOW – Scenario A", DOW_OPTIONS, key="dow_a",
@@ -444,7 +489,7 @@ with tab1:
             _tod_b_opts = [TOD_AVG_ALL] + ALL_TOD
             tod_b = fd.selectbox("TOD – Scenario B", _tod_b_opts, key="tod_b",
                                  index=_tod_b_opts.index("8:00-9:00") if "8:00-9:00" in _tod_b_opts else 0)
-            st.caption("Ratio = Avg Speed (A) ÷ Avg Speed (B)")
+            st.caption("Speed Ratio = Avg Speed (Scenario A) ÷ Avg Speed (Scenario B)")
 
     st.divider()
     map_col, chart_col = st.columns([3, 2])
@@ -458,14 +503,12 @@ with tab1:
                 base.groupby("newSegmentId")["averageSpeed"]
                 .mean().rename("displaySpeed").reset_index()
             )
-            map_title = f"Avg Speed — {dow}  |  All Hours"
         else:
             seg_speed = (
                 base[base["timeSetName"] == tod]
                 .groupby("newSegmentId")["averageSpeed"]
                 .mean().rename("displaySpeed").reset_index()
             )
-            map_title = f"Avg Speed — {dow}  |  {tod}"
 
         map_df = (
             df_geom
@@ -488,7 +531,7 @@ with tab1:
         spd_vmax = float(valid_speeds.max()) if len(valid_speeds) else 1.0
 
         with map_col:
-            st.subheader(map_title)
+            st.subheader("Avg Speed")
             cb_fig = make_speed_colorbar(spd_vmin, spd_vmax)
             if cb_fig:
                 st.plotly_chart(cb_fig, use_container_width=True,
@@ -516,7 +559,7 @@ with tab1:
                 selection_mode="single-object",
                 use_container_width=True,
                 height=470,
-                key="map_avg_speed",
+                key=f"map_avg_speed_{st.session_state.spd_key_ctr}",
             )
 
         with chart_col:
@@ -530,10 +573,23 @@ with tab1:
             selected_id     = st.session_state.spd_sel_id
             selected_street = st.session_state.spd_sel_street
 
+            # ── Selected segment info at top of chart column ───────────────
+            if selected_id:
+                _c_info, _c_clr = st.columns([3, 1])
+                _c_info.markdown(
+                    f"**Selected:** `{selected_id}`  \n"
+                    f"**Street:** {selected_street or 'None'}"
+                )
+                if _c_clr.button("✕ Clear", key="clr_spd"):
+                    st.session_state.spd_sel_id     = None
+                    st.session_state.spd_sel_street = None
+                    st.session_state.spd_key_ctr    += 1
+                    st.rerun()
+
             fig_sys = bar_chart(
                 x=sys_avg["timeSetName"],
                 y=sys_avg["avg_speed"],
-                title=f"Systemwide Avg Speed — {dow}",
+                title="Systemwide Avg Speed",
                 color="#2196F3",
             )
             if selected_id:
@@ -559,15 +615,6 @@ with tab1:
             st.plotly_chart(fig_sys, use_container_width=True)
 
             if selected_id:
-                _c_info, _c_clr = st.columns([3, 1])
-                _c_info.markdown(
-                    f"**Selected:** `{selected_id}`  \n"
-                    f"**Street:** {selected_street or 'None'}"
-                )
-                if _c_clr.button("✕ Clear", key="clr_spd"):
-                    st.session_state.spd_sel_id     = None
-                    st.session_state.spd_sel_street = None
-                    st.rerun()
                 seg_tod = (
                     base[base["newSegmentId"] == selected_id]
                     .groupby("timeSetName")["averageSpeed"].mean()
@@ -635,13 +682,11 @@ with tab1:
         tod_b_lbl = "All hrs" if tod_b == TOD_AVG_ALL else tod_b
 
         with map_col:
-            st.subheader(
-                f"Speed Ratio — ({dow_a} / {tod_a_lbl})  ÷  ({dow_b} / {tod_b_lbl})"
-            )
+            st.subheader("Speed Ratio — Scenario A ÷ Scenario B")
             st.markdown(
-                "<span style='color:#3232FF'>&#9632;</span> A slower (ratio &lt; 1) &nbsp;&nbsp;"
-                "<span style='color:#A0A0A0'>&#9632;</span> No data &nbsp;&nbsp;"
-                "<span style='color:#FF3232'>&#9632;</span> A faster (ratio &gt; 1)",
+                "<span style='color:#1446F0'>&#9632;</span> Scenario A slower &nbsp;&nbsp;"
+                "<span style='color:#B4B4B4'>&#9632;</span> Similar &nbsp;&nbsp;"
+                "<span style='color:#F03C14'>&#9632;</span> Scenario A faster",
                 unsafe_allow_html=True,
             )
             layer = make_layer(
@@ -660,9 +705,9 @@ with tab1:
                         "Segment ID: {newSegmentId}\n"
                         "Street: {street_label}\n"
                         "FRC: {frc_label}\n"
-                        "Ratio (A/B): {ratio_label}\n"
-                        f"Speed A ({dow_a} {tod_a_lbl}): " + "{spd_a_label}\n"
-                        f"Speed B ({dow_b} {tod_b_lbl}): " + "{spd_b_label}"
+                        "Ratio (Scenario A / Scenario B): {ratio_label}\n"
+                        "Speed Scenario A: {spd_a_label}\n"
+                        "Speed Scenario B: {spd_b_label}"
                     )
                 },
             )
@@ -672,7 +717,7 @@ with tab1:
                 selection_mode="single-object",
                 use_container_width=True,
                 height=520,
-                key="map_ratio",
+                key=f"map_ratio_{st.session_state.ratio_key_ctr}",
             )
 
         with chart_col:
@@ -687,7 +732,7 @@ with tab1:
             ratio_sel_street = st.session_state.ratio_sel_street
 
             if ratio_sel_id:
-                # ── Selected segment: show avg speeds for A and B ──────────
+                # ── Selected segment info at top of chart column ───────────
                 _ri, _rclr = st.columns([3, 1])
                 _ri.markdown(
                     f"**Selected:** `{ratio_sel_id}`  \n"
@@ -696,6 +741,7 @@ with tab1:
                 if _rclr.button("✕ Clear", key="clr_ratio"):
                     st.session_state.ratio_sel_id     = None
                     st.session_state.ratio_sel_street = None
+                    st.session_state.ratio_key_ctr    += 1
                     st.rerun()
 
                 if tod_a == TOD_AVG_ALL:
@@ -723,11 +769,10 @@ with tab1:
                     ]["averageSpeed"].mean()
 
                 m1, m2 = st.columns(2)
-                m1.metric(f"Avg Speed A ({dow_a} | {tod_a_lbl})", fmt_speed(seg_spd_a))
-                m2.metric(f"Avg Speed B ({dow_b} | {tod_b_lbl})", fmt_speed(seg_spd_b))
+                m1.metric(f"Avg Speed Scenario A ({dow_a} | {tod_a_lbl})", fmt_speed(seg_spd_a))
+                m2.metric(f"Avg Speed Scenario B ({dow_b} | {tod_b_lbl})", fmt_speed(seg_spd_b))
 
-                # Comparison chart: segment speed A vs B across all TODs
-                # Highlight the selected TOD bin for each scenario
+                # Comparison chart: segment speed Scenario A vs Scenario B across all TODs
                 seg_line_a = (
                     df_speed[
                         (df_speed["dow"] == dow_a) &
@@ -760,14 +805,14 @@ with tab1:
                 fig_seg_cmp = go.Figure()
                 fig_seg_cmp.add_trace(go.Bar(
                     x=seg_line_a["timeSetName"], y=seg_line_a["avg_speed"],
-                    name=f"A: {dow_a} | {tod_a_lbl}", marker_color=_ac,
+                    name=f"Scenario A: {dow_a} | {tod_a_lbl}", marker_color=_ac,
                 ))
                 fig_seg_cmp.add_trace(go.Bar(
                     x=seg_line_b["timeSetName"], y=seg_line_b["avg_speed"],
-                    name=f"B: {dow_b} | {tod_b_lbl}", marker_color=_bc,
+                    name=f"Scenario B: {dow_b} | {tod_b_lbl}", marker_color=_bc,
                 ))
                 fig_seg_cmp.update_layout(
-                    title=dict(text="Selected Segment — Speed A vs B by TOD", font_size=13),
+                    title=dict(text="Selected Segment — Scenario A vs Scenario B by TOD", font_size=13),
                     barmode="group",
                     xaxis_title="Time of Day",
                     yaxis_title="Avg Speed (mph)",
@@ -792,7 +837,7 @@ with tab1:
                 n_faster  = int((valid > 1.05).sum())
                 n_similar = len(valid) - n_slower - n_faster
                 st.markdown(
-                    f"| A slower by >5% | Similar (±5%) | A faster by >5% |\n"
+                    f"| Scenario A slower by >5% | Similar (±5%) | Scenario A faster by >5% |\n"
                     f"|---|---|---|\n"
                     f"| **{n_slower}** segs | **{n_similar}** segs | **{n_faster}** segs |"
                 )
@@ -816,11 +861,11 @@ with tab1:
                 fig_cmp = go.Figure()
                 fig_cmp.add_trace(go.Bar(
                     x=sys_a["timeSetName"], y=sys_a["avg_speed"],
-                    name=f"A: {dow_a}", marker_color="#E53935", opacity=0.8,
+                    name=f"Scenario A: {dow_a}", marker_color="#E53935", opacity=0.8,
                 ))
                 fig_cmp.add_trace(go.Bar(
                     x=sys_b["timeSetName"], y=sys_b["avg_speed"],
-                    name=f"B: {dow_b}", marker_color="#1E88E5", opacity=0.8,
+                    name=f"Scenario B: {dow_b}", marker_color="#1E88E5", opacity=0.8,
                 ))
                 fig_cmp.update_layout(
                     barmode="group",
@@ -846,7 +891,7 @@ with tab2:
         trip_dow = st.selectbox("Day of Week", DOW_OPTIONS, key="trip_dow")
     with t2f2:
         trip_hour = st.selectbox(
-            "Hour of Day (as shown on map)",
+            "Hour of Day (for map)",
             options=[None] + list(range(24)),
             format_func=lambda h: "All (sum across hours)" if h is None else HOUR_LABELS[h],
             key="trip_hour",
@@ -894,7 +939,7 @@ with tab2:
     total_sys_daily = trip_hourly_all["daily_trips"].sum()
 
     with map_col2:
-        st.subheader(f"Daily Trips Ending by Area — {trip_dow}  |  {hour_label_str}")
+        st.subheader("Daily Trips Ending by Area")
         st.markdown(
             "<span style='color:#DCF0FF'>&#9632;</span> Fewer trips &nbsp;&nbsp;"
             "<span style='color:#003FB5'>&#9632;</span> More trips &nbsp;&nbsp;"
@@ -916,7 +961,7 @@ with tab2:
             selection_mode="single-object",
             use_container_width=True,
             height=520,
-            key="map_geofence",
+            key=f"map_geofence_{st.session_state.trip_key_ctr}",
         )
 
     with chart_col2:
@@ -928,6 +973,34 @@ with tab2:
         except Exception:
             pass
         selected_area = st.session_state.trip_sel_area
+
+        # ── Selected area info at top of chart column ──────────────────────
+        sel_daily_total = None
+        trip_hourly_sel = None
+        y_sel = None
+        if selected_area is not None:
+            trip_hourly_sel = (
+                df_trips[
+                    (df_trips["dow"] == trip_dow) &
+                    (df_trips["destination_region"] == selected_area)
+                ]
+                .groupby("start_hour")["daily_trip_wt"]
+                .sum()
+                .reindex(range(24), fill_value=0)
+                .reset_index()
+                .rename(columns={"daily_trip_wt": "daily_trips"})
+            )
+            sel_daily_total = trip_hourly_sel["daily_trips"].sum()
+
+            _ai, _aclr = st.columns([3, 1])
+            _ai.markdown(
+                f"**Selected: Area {selected_area}**  \n"
+                f"**Total Daily Trips: {int(round(sel_daily_total)):,}**"
+            )
+            if _aclr.button("✕ Clear", key="clr_trip"):
+                st.session_state.trip_sel_area = None
+                st.session_state.trip_key_ctr  += 1
+                st.rerun()
 
         # Chart scale toggle — lives next to the chart, not in the filter bar
         trip_scale = st.radio(
@@ -947,28 +1020,7 @@ with tab2:
             y_sys = trip_hourly_all["daily_trips"]
             yaxis_t2 = "Daily Trips"
 
-        fig_all = go.Figure(go.Bar(
-            x=HOUR_LABELS, y=y_sys,
-            marker_color="#2196F3", opacity=0.85, name="All Areas",
-        ))
-
-        # Selected area processing (needed before chart & info display)
-        trip_hourly_sel = None
-        sel_daily_total = None
-        if selected_area is not None:
-            trip_hourly_sel = (
-                df_trips[
-                    (df_trips["dow"] == trip_dow) &
-                    (df_trips["destination_region"] == selected_area)
-                ]
-                .groupby("start_hour")["daily_trip_wt"]
-                .sum()
-                .reindex(range(24), fill_value=0)
-                .reset_index()
-                .rename(columns={"daily_trip_wt": "daily_trips"})
-            )
-            sel_daily_total = trip_hourly_sel["daily_trips"].sum()
-
+        if selected_area is not None and sel_daily_total is not None:
             if trip_scale == "% of Total Daily Trips":
                 y_sel = (
                     trip_hourly_sel["daily_trips"] / sel_daily_total * 100
@@ -976,6 +1028,12 @@ with tab2:
             else:
                 y_sel = trip_hourly_sel["daily_trips"]
 
+        fig_all = go.Figure(go.Bar(
+            x=HOUR_LABELS, y=y_sys,
+            marker_color="#2196F3", opacity=0.85, name="All Areas",
+        ))
+
+        if y_sel is not None:
             fig_all.add_trace(
                 go.Scatter(
                     x=HOUR_LABELS, y=y_sel,
@@ -990,7 +1048,7 @@ with tab2:
             )
 
         fig_all.update_layout(
-            title=dict(text=f"All Areas — Daily Trips by Hour ({trip_dow})", font_size=13),
+            title=dict(text="All Areas — Daily Trips by Hour", font_size=13),
             xaxis_title="Hour of Day",
             yaxis_title=yaxis_t2,
             xaxis_tickangle=-45,
@@ -1001,16 +1059,7 @@ with tab2:
         )
         st.plotly_chart(fig_all, use_container_width=True)
 
-        if selected_area is not None and sel_daily_total is not None:
-            _ai, _aclr = st.columns([3, 1])
-            _ai.markdown(
-                f"**Selected: Area {selected_area}**  \n"
-                f"**Total Daily Trips ({trip_dow}): {int(round(sel_daily_total)):,}**"
-            )
-            if _aclr.button("✕ Clear", key="clr_trip"):
-                st.session_state.trip_sel_area = None
-                st.rerun()
-
+        if selected_area is not None and y_sel is not None:
             # Hourly profile chart for selected area
             fig_sel_area = go.Figure(go.Bar(
                 x=HOUR_LABELS, y=y_sel,
@@ -1018,7 +1067,7 @@ with tab2:
             ))
             fig_sel_area.update_layout(
                 title=dict(
-                    text=f"Area {selected_area} — Daily Trips by Hour ({trip_dow})",
+                    text=f"Area {selected_area} — Daily Trips by Hour",
                     font_size=13,
                 ),
                 xaxis_title="Hour of Day",
@@ -1035,78 +1084,67 @@ with tab2:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 3 – SEGMENT AADT
+# TAB 3 – TRAFFIC VOLUMES
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab3:
 
-    a3f1, a3f2, _ = st.columns([1, 2, 3])
-    with a3f1:
-        aadt_dow = st.selectbox("Day of Week", DOW_OPTIONS, key="aadt_dow")
-    with a3f2:
-        aadt_tod = st.selectbox(
+    v3f1, v3f2, _ = st.columns([1, 2, 3])
+    with v3f1:
+        vol_dow = st.selectbox("Day of Week", DOW_OPTIONS, key="vol_dow")
+    with v3f2:
+        vol_tod = st.selectbox(
             "Time of Day (as shown on map)",
-            [TOD_SUM_ALL] + ALL_AADT_TOD,
-            key="aadt_tod",
+            [TOD_SUM_ALL] + ALL_VOL_TOD,
+            key="vol_tod",
         )
 
     st.divider()
     map_col3, chart_col3 = st.columns([3, 2])
 
-    # Aggregate AADT for map
-    aadt_base = df_aadt[df_aadt["dow"] == aadt_dow].copy()
+    # ── Build map data from hourly volume dataframe ────────────────────────────
+    vol_base = df_vol_hourly[df_vol_hourly["dow"] == vol_dow].copy()
 
-    if aadt_tod == TOD_SUM_ALL:
-        seg_aadt = (
-            aadt_base.groupby("newSegmentId")["aadt"]
-            .sum().rename("displayAADT").reset_index()
+    if vol_tod == TOD_SUM_ALL:
+        seg_vol = (
+            vol_base.groupby("newSegmentId")["volume"]
+            .sum().rename("displayVol").reset_index()
         )
-        aadt_map_title = f"AADT — {aadt_dow}  |  All Hours"
     else:
-        seg_aadt = (
-            aadt_base[aadt_base["timeSetName"] == aadt_tod]
-            .groupby("newSegmentId")["aadt"]
-            .sum().rename("displayAADT").reset_index()
+        seg_vol = (
+            vol_base[vol_base["timeSetName"] == vol_tod]
+            .groupby("newSegmentId")["volume"]
+            .sum().rename("displayVol").reset_index()
         )
-        aadt_map_title = f"AADT — {aadt_dow}  |  {aadt_tod}"
 
-    aadt_map_df = (
+    vol_map_df = (
         df_geom
         .merge(df_seg_attr, on="newSegmentId", how="left")
-        .merge(seg_aadt,    on="newSegmentId", how="left")
+        .merge(seg_vol,     on="newSegmentId", how="left")
     )
-    aadt_map_df["color"]        = blue_gradient_color(aadt_map_df["displayAADT"])
-    aadt_map_df["aadt_label"]   = aadt_map_df["displayAADT"].apply(fmt_aadt)
-    aadt_map_df["frc_label"]    = aadt_map_df["frc"].apply(fmt_frc)
-    aadt_map_df["street_label"] = aadt_map_df["street"].apply(fmt_str)
+    vol_map_df["color"]        = blue_gradient_color(vol_map_df["displayVol"], alpha=240)
+    vol_map_df["vol_label"]    = vol_map_df["displayVol"].apply(fmt_aadt)
+    vol_map_df["frc_label"]    = vol_map_df["frc"].apply(fmt_frc)
+    vol_map_df["street_label"] = vol_map_df["street"].apply(fmt_str)
 
-    valid_aadt = aadt_map_df["displayAADT"].dropna()
-    aadt_vmin = float(valid_aadt.min()) if len(valid_aadt) else 0.0
-    aadt_vmax = float(valid_aadt.max()) if len(valid_aadt) else 1.0
-
-    # Systemwide AADT by TOD for bar chart
-    aadt_sys_tod = (
-        aadt_base.groupby("timeSetName")["aadt"]
-        .sum()
-        .reindex(ALL_AADT_TOD).reset_index()
-        .rename(columns={"aadt": "total_aadt"})
-    )
-    aadt_sys_total = aadt_sys_tod["total_aadt"].sum()
+    valid_vol = vol_map_df["displayVol"].dropna()
+    vol_vmin = float(valid_vol.min()) if len(valid_vol) else 0.0
+    vol_vmax = float(valid_vol.max()) if len(valid_vol) else 1.0
 
     with map_col3:
-        st.subheader(aadt_map_title)
-        cb_aadt = make_aadt_colorbar(aadt_vmin, aadt_vmax)
-        if cb_aadt:
-            st.plotly_chart(cb_aadt, use_container_width=True,
+        st.subheader("Daily Volumes")
+        cb_vol = make_volume_colorbar(vol_vmin, vol_vmax)
+        if cb_vol:
+            st.plotly_chart(cb_vol, use_container_width=True,
                             config={"displayModeBar": False})
 
-        aadt_layer = make_layer(
-            aadt_map_df[[
+        vol_layer = make_layer(
+            vol_map_df[[
                 "newSegmentId", "path", "color",
-                "aadt_label", "street_label", "frc_label",
+                "vol_label", "street_label", "frc_label",
             ]]
         )
-        aadt_deck = pdk.Deck(
-            layers=[aadt_layer],
+        vol_deck = pdk.Deck(
+            layers=[vol_layer],
             initial_view_state=VIEW_STATE,
             map_style=MAP_STYLE,
             tooltip={
@@ -1114,130 +1152,92 @@ with tab3:
                     "Segment ID: {newSegmentId}\n"
                     "Street: {street_label}\n"
                     "FRC: {frc_label}\n"
-                    "AADT: {aadt_label}"
+                    "Volume: {vol_label}"
                 )
             },
         )
-        aadt_event = st.pydeck_chart(
-            aadt_deck,
+        vol_event = st.pydeck_chart(
+            vol_deck,
             on_select="rerun",
             selection_mode="single-object",
             use_container_width=True,
             height=470,
-            key="map_aadt",
+            key=f"map_vol_{st.session_state.vol_key_ctr}",
         )
 
     with chart_col3:
         # Persist selection across filter changes
         try:
-            a_objs = aadt_event.selection.objects.get("segments", [])
-            if a_objs:
-                st.session_state.aadt_sel_id     = a_objs[0].get("newSegmentId")
-                st.session_state.aadt_sel_street = a_objs[0].get("street_label")
+            v_objs = vol_event.selection.objects.get("segments", [])
+            if v_objs:
+                st.session_state.vol_sel_id     = v_objs[0].get("newSegmentId")
+                st.session_state.vol_sel_street = v_objs[0].get("street_label")
         except Exception:
             pass
-        aadt_sel_id     = st.session_state.aadt_sel_id
-        aadt_sel_street = st.session_state.aadt_sel_street
+        vol_sel_id     = st.session_state.vol_sel_id
+        vol_sel_street = st.session_state.vol_sel_street
 
-        # Chart scale toggle — inline, not in filter bar
-        aadt_scale = st.radio(
-            "Chart scale",
-            ["AADT", "% of AADT"],
-            key="aadt_scale",
-            horizontal=True,
-            label_visibility="collapsed",
-        )
-
-        # Scale for systemwide chart
-        if aadt_scale == "% of AADT":
-            y_aadt_sys = (aadt_sys_tod["total_aadt"] / aadt_sys_total * 100).fillna(0) \
-                         if aadt_sys_total > 0 else aadt_sys_tod["total_aadt"] * 0
-            yaxis_a3 = "% of Daily AADT"
-        else:
-            y_aadt_sys = aadt_sys_tod["total_aadt"]
-            yaxis_a3 = "AADT"
-
-        fig_aadt_sys = go.Figure(go.Bar(
-            x=aadt_sys_tod["timeSetName"],
-            y=y_aadt_sys,
-            marker_color="#2196F3", opacity=0.85, name="Systemwide",
-        ))
-
-        # Selected segment processing
-        seg_aadt_tod = None
-        sel_display_aadt = None
-        if aadt_sel_id:
-            seg_aadt_tod = (
-                aadt_base[aadt_base["newSegmentId"] == aadt_sel_id]
-                .groupby("timeSetName")["aadt"]
+        if vol_sel_id:
+            # ── Selected segment: topline summary + bar chart + datatable ──
+            seg_vol_hourly = (
+                vol_base[vol_base["newSegmentId"] == vol_sel_id]
+                .groupby("timeSetName")["volume"]
                 .sum()
-                .reindex(ALL_AADT_TOD).reset_index()
-                .rename(columns={"aadt": "seg_aadt"})
+                .reindex(ALL_VOL_TOD).reset_index()
+                .rename(columns={"volume": "seg_vol"})
             )
 
-            if aadt_tod == TOD_SUM_ALL:
-                sel_display_aadt = seg_aadt_tod["seg_aadt"].sum()
+            if vol_tod == TOD_SUM_ALL:
+                sel_display_vol = seg_vol_hourly["seg_vol"].sum()
             else:
-                _row = seg_aadt_tod[seg_aadt_tod["timeSetName"] == aadt_tod]
-                sel_display_aadt = _row["seg_aadt"].values[0] if len(_row) else np.nan
+                _row = seg_vol_hourly[seg_vol_hourly["timeSetName"] == vol_tod]
+                sel_display_vol = _row["seg_vol"].values[0] if len(_row) else np.nan
 
-            seg_total = seg_aadt_tod["seg_aadt"].sum()
-            if aadt_scale == "% of AADT":
-                y_aadt_sel = (seg_aadt_tod["seg_aadt"] / seg_total * 100).fillna(0) \
-                             if seg_total > 0 else seg_aadt_tod["seg_aadt"] * 0
-            else:
-                y_aadt_sel = seg_aadt_tod["seg_aadt"]
-
-            fig_aadt_sys.add_trace(
-                go.Scatter(
-                    x=seg_aadt_tod["timeSetName"],
-                    y=y_aadt_sel,
-                    mode="lines+markers",
-                    name="Selected segment",
-                    line=dict(color="#FF9800", width=2),
-                    marker=dict(size=6),
-                )
+            # ── Info + Clear at top ────────────────────────────────────────
+            _vi3, _vclr3 = st.columns([3, 1])
+            tod_suffix = vol_tod if vol_tod != TOD_SUM_ALL else "Daily Total"
+            _vi3.markdown(
+                f"**Selected:** `{vol_sel_id}`  "
+                f"— **{vol_sel_street or 'None'}**  \n"
+                f"**{tod_suffix} Volume: {fmt_aadt(sel_display_vol)}**"
             )
-            fig_aadt_sys.update_layout(
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-            )
-
-        fig_aadt_sys.update_layout(
-            title=dict(text=f"Systemwide AADT by TOD — {aadt_dow}", font_size=13),
-            xaxis_title="Time of Day",
-            yaxis_title=yaxis_a3,
-            xaxis_tickangle=-45,
-            height=310,
-            margin=dict(t=40, b=70, l=50, r=10),
-            xaxis=dict(gridcolor="#e0e0e0"),
-            yaxis_gridcolor="#e0e0e0",
-        )
-        st.plotly_chart(fig_aadt_sys, use_container_width=True)
-
-        if aadt_sel_id and sel_display_aadt is not None:
-            tod_suffix = aadt_tod if aadt_tod != TOD_SUM_ALL else "Daily Total"
-            _ai3, _aclr3 = st.columns([3, 1])
-            _ai3.markdown(
-                f"**Selected:** `{aadt_sel_id}`  "
-                f"— **{aadt_sel_street or 'None'}**  \n"
-                f"**{tod_suffix} AADT: {fmt_aadt(sel_display_aadt)}**"
-            )
-            if _aclr3.button("✕ Clear", key="clr_aadt"):
-                st.session_state.aadt_sel_id     = None
-                st.session_state.aadt_sel_street = None
+            if _vclr3.button("✕ Clear", key="clr_vol"):
+                st.session_state.vol_sel_id     = None
+                st.session_state.vol_sel_street = None
+                st.session_state.vol_key_ctr    += 1
                 st.rerun()
-            seg_table = seg_aadt_tod.rename(
-                columns={"timeSetName": "Time of Day", "seg_aadt": "AADT"}
+
+            # ── Hourly bar chart ───────────────────────────────────────────
+            fig_vol_seg = go.Figure(go.Bar(
+                x=seg_vol_hourly["timeSetName"],
+                y=seg_vol_hourly["seg_vol"],
+                marker_color="#2196F3", opacity=0.85, name="Volume",
+            ))
+            fig_vol_seg.update_layout(
+                title=dict(text="Selected Segment — Volume by Hour", font_size=13),
+                xaxis_title="Hour",
+                yaxis_title="Volume",
+                xaxis_tickangle=-45,
+                height=310,
+                margin=dict(t=40, b=70, l=50, r=10),
+                xaxis=dict(gridcolor="#e0e0e0"),
+                yaxis_gridcolor="#e0e0e0",
+            )
+            st.plotly_chart(fig_vol_seg, use_container_width=True)
+
+            # ── Datatable ─────────────────────────────────────────────────
+            seg_vol_table = seg_vol_hourly.rename(
+                columns={"timeSetName": "Hour", "seg_vol": "Volume"}
             ).copy()
-            seg_table["AADT"] = seg_table["AADT"].apply(
+            seg_vol_table["Volume"] = seg_vol_table["Volume"].apply(
                 lambda v: int(round(v)) if pd.notna(v) else None
             )
-            st.markdown("**Selected Segment — AADT by Time of Day**")
+            st.markdown("**Selected Segment — Volume by Hour**")
             st.dataframe(
-                seg_table,
+                seg_vol_table,
                 use_container_width=True,
                 hide_index=True,
-                height=min(420, 38 + len(seg_table) * 35),
+                height=min(420, 38 + len(seg_vol_table) * 35),
             )
         else:
-            st.info("Click a segment on the map to see its AADT time-of-day profile.")
+            st.info("Click a segment on the map to see its hourly volume profile.")
