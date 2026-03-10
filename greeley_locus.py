@@ -80,6 +80,18 @@ def tod_sort_key(label: str) -> int:
         return -1
 
 
+def get_bin_hours(label: str) -> int:
+    """Return number of hours spanned by a TOD label like '10:00-16:00'."""
+    import re
+    m = re.match(r"^(\d+):00\s*[-–]\s*(\d+):00$", str(label).strip())
+    if not m:
+        return 1
+    s, e = int(m.group(1)), int(m.group(2))
+    if e <= s:
+        e += 24
+    return max(e - s, 1)
+
+
 def geom_to_path(geom):
     if geom is None or geom.is_empty:
         return None
@@ -974,7 +986,7 @@ with tab2:
             pass
         selected_area = st.session_state.trip_sel_area
 
-        # ── Selected area info at top of chart column ──────────────────────
+        # ── Summary / selected info at top ────────────────────────────────
         sel_daily_total = None
         trip_hourly_sel = None
         y_sel = None
@@ -992,15 +1004,16 @@ with tab2:
             )
             sel_daily_total = trip_hourly_sel["daily_trips"].sum()
 
+            # Volume number first, then ID + Clear
+            st.metric("Selected Area Daily Trips", f"{int(round(sel_daily_total)):,}")
             _ai, _aclr = st.columns([3, 1])
-            _ai.markdown(
-                f"**Selected: Area {selected_area}**  \n"
-                f"**Total Daily Trips: {int(round(sel_daily_total)):,}**"
-            )
+            _ai.markdown(f"**Selected: Area {selected_area}**")
             if _aclr.button("✕ Clear", key="clr_trip"):
                 st.session_state.trip_sel_area = None
                 st.session_state.trip_key_ctr  += 1
                 st.rerun()
+        else:
+            st.metric("Total Daily Trips (All Areas)", f"{int(round(total_sys_daily)):,}")
 
         # Chart scale toggle — lives next to the chart, not in the filter bar
         trip_scale = st.radio(
@@ -1094,25 +1107,25 @@ with tab3:
     with v3f2:
         vol_tod = st.selectbox(
             "Time of Day (as shown on map)",
-            [TOD_SUM_ALL] + ALL_VOL_TOD,
+            [TOD_SUM_ALL] + ALL_AADT_TOD,
             key="vol_tod",
         )
 
     st.divider()
     map_col3, chart_col3 = st.columns([3, 2])
 
-    # ── Build map data from hourly volume dataframe ────────────────────────────
-    vol_base = df_vol_hourly[df_vol_hourly["dow"] == vol_dow].copy()
+    # ── Build map data from original AADT dataframe ────────────────────────────
+    vol_base = df_aadt[df_aadt["dow"] == vol_dow].copy()
 
     if vol_tod == TOD_SUM_ALL:
         seg_vol = (
-            vol_base.groupby("newSegmentId")["volume"]
+            vol_base.groupby("newSegmentId")["aadt"]
             .sum().rename("displayVol").reset_index()
         )
     else:
         seg_vol = (
             vol_base[vol_base["timeSetName"] == vol_tod]
-            .groupby("newSegmentId")["volume"]
+            .groupby("newSegmentId")["aadt"]
             .sum().rename("displayVol").reset_index()
         )
 
@@ -1178,28 +1191,27 @@ with tab3:
         vol_sel_street = st.session_state.vol_sel_street
 
         if vol_sel_id:
-            # ── Selected segment: topline summary + bar chart + datatable ──
-            seg_vol_hourly = (
+            # ── Selected segment: aggregate by original TOD bins ──────────
+            seg_vol_by_tod = (
                 vol_base[vol_base["newSegmentId"] == vol_sel_id]
-                .groupby("timeSetName")["volume"]
+                .groupby("timeSetName")["aadt"]
                 .sum()
-                .reindex(ALL_VOL_TOD).reset_index()
-                .rename(columns={"volume": "seg_vol"})
+                .reindex(ALL_AADT_TOD).reset_index()
+                .rename(columns={"aadt": "seg_vol"})
             )
 
             if vol_tod == TOD_SUM_ALL:
-                sel_display_vol = seg_vol_hourly["seg_vol"].sum()
+                sel_display_vol = seg_vol_by_tod["seg_vol"].sum()
             else:
-                _row = seg_vol_hourly[seg_vol_hourly["timeSetName"] == vol_tod]
+                _row = seg_vol_by_tod[seg_vol_by_tod["timeSetName"] == vol_tod]
                 sel_display_vol = _row["seg_vol"].values[0] if len(_row) else np.nan
 
-            # ── Info + Clear at top ────────────────────────────────────────
-            _vi3, _vclr3 = st.columns([3, 1])
+            # ── Volume metric first, then segment ID + Clear ──────────────
             tod_suffix = vol_tod if vol_tod != TOD_SUM_ALL else "Daily Total"
+            st.metric(f"{tod_suffix} Volume", fmt_aadt(sel_display_vol))
+            _vi3, _vclr3 = st.columns([3, 1])
             _vi3.markdown(
-                f"**Selected:** `{vol_sel_id}`  "
-                f"— **{vol_sel_street or 'None'}**  \n"
-                f"**{tod_suffix} Volume: {fmt_aadt(sel_display_vol)}**"
+                f"**Selected:** `{vol_sel_id}` — **{vol_sel_street or 'None'}**"
             )
             if _vclr3.button("✕ Clear", key="clr_vol"):
                 st.session_state.vol_sel_id     = None
@@ -1207,32 +1219,43 @@ with tab3:
                 st.session_state.vol_key_ctr    += 1
                 st.rerun()
 
-            # ── Hourly bar chart ───────────────────────────────────────────
+            # ── Bar chart: avg hourly for multi-hour bins; 0:xx last ──────
+            seg_vol_bar = seg_vol_by_tod.copy()
+            seg_vol_bar["n_hours"]      = seg_vol_bar["timeSetName"].apply(get_bin_hours)
+            seg_vol_bar["seg_vol_norm"] = seg_vol_bar["seg_vol"] / seg_vol_bar["n_hours"]
+            # Sort: bins starting ≥7 first (ascending), then bins starting <7 at end
+            seg_vol_bar["_sort"] = seg_vol_bar["timeSetName"].apply(
+                lambda lbl: (int(lbl.split(":")[0]) + 24)
+                if int(lbl.split(":")[0]) < 7 else int(lbl.split(":")[0])
+            )
+            seg_vol_bar = seg_vol_bar.sort_values("_sort")
+
             fig_vol_seg = go.Figure(go.Bar(
-                x=seg_vol_hourly["timeSetName"],
-                y=seg_vol_hourly["seg_vol"],
-                marker_color="#2196F3", opacity=0.85, name="Volume",
+                x=seg_vol_bar["timeSetName"],
+                y=seg_vol_bar["seg_vol_norm"],
+                marker_color="#2196F3", opacity=0.85, name="Avg Hourly Volume",
             ))
             fig_vol_seg.update_layout(
-                title=dict(text="Selected Segment — Volume by Hour", font_size=13),
-                xaxis_title="Hour",
-                yaxis_title="Volume",
+                title=dict(text="Selected Segment — Avg Hourly Volume by TOD", font_size=13),
+                xaxis_title="Time of Day",
+                yaxis_title="Avg Hourly Volume",
                 xaxis_tickangle=-45,
                 height=310,
                 margin=dict(t=40, b=70, l=50, r=10),
-                xaxis=dict(gridcolor="#e0e0e0"),
+                xaxis=dict(gridcolor="#e0e0e0", categoryorder="array",
+                           categoryarray=list(seg_vol_bar["timeSetName"])),
                 yaxis_gridcolor="#e0e0e0",
             )
             st.plotly_chart(fig_vol_seg, use_container_width=True)
 
-            # ── Datatable ─────────────────────────────────────────────────
-            seg_vol_table = seg_vol_hourly.rename(
-                columns={"timeSetName": "Hour", "seg_vol": "Volume"}
+            # ── Datatable: actual totals per TOD bin ──────────────────────
+            seg_vol_table = seg_vol_by_tod.rename(
+                columns={"timeSetName": "Time of Day", "seg_vol": "Volume"}
             ).copy()
             seg_vol_table["Volume"] = seg_vol_table["Volume"].apply(
                 lambda v: int(round(v)) if pd.notna(v) else None
             )
-            st.markdown("**Selected Segment — Volume by Hour**")
+            st.markdown("**Selected Segment — Volume by Time of Day**")
             st.dataframe(
                 seg_vol_table,
                 use_container_width=True,
@@ -1240,4 +1263,4 @@ with tab3:
                 height=min(420, 38 + len(seg_vol_table) * 35),
             )
         else:
-            st.info("Click a segment on the map to see its hourly volume profile.")
+            st.info("Click a segment on the map to see its volume profile.")
